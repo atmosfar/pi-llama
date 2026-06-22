@@ -466,12 +466,12 @@ export default async function (pi: ExtensionAPI) {
 			}
 			discoveredMetadata.add(modelId);
 			if (loadedFooterStatus && ctx) {
-				const prefix = ctx.ui.theme.fg("success", "[llama.cpp]   ");
+				const prefix = ctx.ui.theme.fg("success", "[llama.cpp] ✓");
 				ctx.ui.setWidget(PROVIDER_ID, [
 					prefix +
 						ctx.ui.theme.fg(
 							"text",
-							`${displayName}: Loaded` + (nCtx ? ` with context ${nCtx} tokens` : ""),
+							` ${displayName}: Loaded` + (nCtx ? ` with context ${nCtx} tokens` : ""),
 						),
 				]);
 				clearFooterStatusLater();
