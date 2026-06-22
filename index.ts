@@ -10,6 +10,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { Compile } from "typebox/compile";
+import { Loader, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
 const PROVIDER_ID = "llama-cpp";
 const DEFAULT_BASE_URL = "http://localhost:8080/v1";
@@ -26,6 +27,7 @@ const ModelsResponseSchema = Type.Object({
 		Type.Array(
 			Type.Object({
 				id: Type.String(),
+				aliases: Type.Optional(Type.Array(Type.String())),
 				status: Type.Optional(
 					Type.Object({
 						value: Type.Optional(
@@ -68,6 +70,33 @@ const PropsResponseSchema = Type.Object({
 });
 
 const validatePropsResponse = Compile(PropsResponseSchema);
+
+// SSE event types for model loading progress
+type ApiModelLoadStage = "text_model" | "spec_model" | "mmproj_model";
+
+type ApiModelsSseProgress = {
+	stages: ApiModelLoadStage[];
+	current: ApiModelLoadStage;
+	value: number;
+};
+
+type ApiModelsSseData = {
+	status: string;
+	progress?: ApiModelsSseProgress;
+	exit_code?: number;
+};
+
+type ApiModelsSseEvent = {
+	model: string;
+	event: string;
+	data: ApiModelsSseData;
+};
+
+const MODEL_LOAD_STAGE_LABELS: Record<ApiModelLoadStage, string> = {
+	text_model: "Loading weights",
+	spec_model: "Loading draft",
+	mmproj_model: "Loading projector",
+};
 
 type LlamaModel = NonNullable<Parameters<ExtensionAPI["registerProvider"]>[1]["models"]>[number];
 type ExtensionCtx = Parameters<Parameters<ExtensionAPI["on"]>[1]>[1];
@@ -170,9 +199,10 @@ export default async function (pi: ExtensionAPI) {
 				}
 				const contextWindow =
 					model.meta?.n_ctx ?? previous?.contextWindow ?? DEFAULT_CONTEXT_WINDOW;
+				const displayName = model.aliases?.[0] || model.id;
 				return {
 					id: model.id,
-					name: suffixes.length > 0 ? `${model.id} ${suffixes.join(" ")}` : model.id,
+					name: suffixes.length > 0 ? `${displayName} ${suffixes.join(" ")}` : displayName,
 					// /v1/models does not include /props-discovered capabilities, so preserve
 					// template thinking metadata across refreshes.
 					reasoning: previous?.reasoning ?? false,
@@ -205,11 +235,120 @@ export default async function (pi: ExtensionAPI) {
 	const discoveredMetadata = new Set<string>();
 	const pendingMetadata = new Set<string>();
 	let statusTimeout: ReturnType<typeof setTimeout> | undefined;
+	let sseAbortController: AbortController | null = null;
 
 	function clearFooterStatusTimeout(): void {
 		if (statusTimeout !== undefined) {
 			clearTimeout(statusTimeout);
 			statusTimeout = undefined;
+		}
+	}
+
+	// Connect to SSE stream for model loading progress
+	async function connectToLoadingProgress(
+		modelId: string,
+		ctx: ExtensionCtx,
+		loader: Loader,
+	): Promise<void> {
+		// Close any existing SSE connection
+		if (sseAbortController) {
+			sseAbortController.abort();
+			sseAbortController = null;
+		}
+
+		sseAbortController = new AbortController();
+		const signal = sseAbortController.signal;
+
+		try {
+			const response = await fetch(`${baseUrl.replace(/\/v1$/, "")}/models/sse`, { signal });
+
+			if (!response.ok) {
+				console.warn(`[llama-cpp] SSE connection failed: ${response.status}`);
+				return;
+			}
+
+			const reader = response.body?.getReader();
+			if (!reader) {
+				return;
+			}
+
+			const decoder = new TextDecoder();
+			let buffer = "";
+
+			while (!signal.aborted) {
+				const { done, value } = await reader.read();
+				if (done) {
+					break;
+				}
+
+				buffer += decoder.decode(value, { stream: true });
+				const events = buffer.split("\n\n");
+				buffer = events.pop() || "";
+
+				for (const event of events) {
+					if (!event) {
+						continue;
+					}
+
+					// Parse SSE record: extract data lines
+					const dataLines = event
+						.split("\n")
+						.filter((line) => line.startsWith("data:"))
+						.map((line) => line.slice(5).trim())
+						.join("\n");
+
+					if (!dataLines) {
+						continue;
+					}
+
+					try {
+						const sseEvent: ApiModelsSseEvent = JSON.parse(dataLines);
+						const currentModel = currentModels.find((m) => m.id === sseEvent.model);
+						const displayName = currentModel?.name.split(" ")[0] || sseEvent.model;
+
+						if (
+							sseEvent.event === "model_status" ||
+							sseEvent.event === "status_change" ||
+							sseEvent.event === "status_update"
+						) {
+							const status = sseEvent.data.status;
+							const progress = sseEvent.data.progress;
+
+							if (sseEvent.data.exit_code && sseEvent.data.exit_code !== 0) {
+								ctx?.ui.setWidget(PROVIDER_ID, [
+									ctx?.ui.theme.fg("error", "[llama.cpp] ") +
+										ctx?.ui.theme.fg(
+											"text",
+											`${displayName}:  failed (exit ${sseEvent.data.exit_code})`,
+										),
+								]);
+								sseAbortController?.abort();
+								return;
+							}
+
+							if (status === "unloaded") {
+								discoveredMetadata.delete(sseEvent.model);
+							}
+
+							if (status === "loading" && progress) {
+								const stageLabel = progress.current
+									? MODEL_LOAD_STAGE_LABELS[progress.current] || progress.current
+									: "Loading";
+								const progressPercent = Math.round(progress.value * 100);
+								loader?.setMessage(`${displayName}: ${stageLabel} (${progressPercent}%)`);
+							}
+						}
+					} catch {
+						// Ignore parse errors
+					}
+				}
+			}
+		} catch (error) {
+			if (!(error instanceof DOMException && error.name === "AbortError")) {
+				console.warn(`[llama-cpp] SSE error: ${(error as Error).message}`);
+			}
+		} finally {
+			sseAbortController = null;
 		}
 	}
 
@@ -224,6 +363,7 @@ export default async function (pi: ExtensionAPI) {
 		if (!model) {
 			return;
 		}
+		const displayName = model.name.split(" ")[0];
 		if (discoveredMetadata.has(modelId)) {
 			// Provider re-registration does not update Pi's active model snapshot, so copy
 			// already-discovered metadata into the selected model when available.
@@ -243,6 +383,8 @@ export default async function (pi: ExtensionAPI) {
 		}
 
 		pendingMetadata.add(modelId);
+		// Cancel any pending clear timeout from a previous model load.
+		clearFooterStatusTimeout();
 		const controller = new AbortController();
 		const timer = setTimeout(() => controller.abort(), timeoutMs);
 		const propsUrl = `${baseUrl.replace(/\/v1$/, "")}/props?model=${encodeURIComponent(modelId)}&autoload=${autoload}`;
@@ -250,18 +392,43 @@ export default async function (pi: ExtensionAPI) {
 			clearFooterStatusTimeout();
 			statusTimeout = setTimeout(() => {
 				statusTimeout = undefined;
-				ctx?.ui.setStatus(PROVIDER_ID, undefined);
+				ctx?.ui.setWidget(PROVIDER_ID, () => {
+					return {
+						render: () => {
+							return " ";
+						},
+					};
+				});
 			}, 8000);
 		};
 
 		try {
 			if (autoload && ctx) {
-				ctx.ui.setStatus(PROVIDER_ID, ctx.ui.theme.fg("dim", `[llama.cpp] loading: ${modelId}`));
+				let loader = null;
+				ctx.ui.setWidget(PROVIDER_ID, (ui, theme) => {
+					const prefix = theme.fg("accent", " [llama.cpp]");
+					const prefixWidth = visibleWidth(" [llama.cpp]");
+					loader = new Loader(
+						ui,
+						(s) => theme.fg("accent", s),
+						(t) => theme.fg("text", t),
+						`${displayName}: Loading...`,
+					);
+					return {
+						dispose: () => loader?.stop(),
+						render: (width: number) => {
+							const [_, line] = loader.render(width - prefixWidth);
+							return [prefix + truncateToWidth(line, width - prefixWidth)];
+						},
+					};
+				});
+				// Start SSE connection to monitor loading progress
+				void connectToLoadingProgress(modelId, ctx, loader);
 			}
 
 			const response = await fetch(propsUrl, { signal: controller.signal });
 			if (!response.ok) {
-				ctx?.ui.setStatus(PROVIDER_ID, undefined);
+				ctx?.ui.setWidget(PROVIDER_ID, undefined);
 				ctx?.ui.notify(`[llama-cpp] /props for ${modelId} returned ${response.status}`, "error");
 				return;
 			}
@@ -270,17 +437,17 @@ export default async function (pi: ExtensionAPI) {
 				const errors = [...validatePropsResponse.Errors(data)]
 					.map((e) => `${"path" in e ? e.path : ""} ${e.message}`)
 					.join("; ");
-				ctx?.ui.setStatus(PROVIDER_ID, undefined);
+				ctx?.ui.setWidget(PROVIDER_ID, undefined);
 				ctx?.ui.notify(`[llama-cpp] invalid /props response for ${modelId}: ${errors}`, "error");
 				return;
 			}
 			const nCtx = data.default_generation_settings?.n_ctx;
 			let updated = false;
-			let loadedFooterStatus = autoload ? `[llama.cpp] ${modelId} loaded` : undefined;
+			let loadedFooterStatus = autoload ? `[llama.cpp] ${displayName} loaded` : undefined;
 			if (typeof nCtx === "number" && nCtx > 0) {
 				model.contextWindow = nCtx;
 				model.maxTokens = Math.min(DEFAULT_MAX_TOKENS, nCtx);
-				loadedFooterStatus = `[llama.cpp] ${modelId} loaded with ctx ${nCtx} tokens`;
+				loadedFooterStatus = `[llama.cpp] ${displayName} loaded with ctx ${nCtx} tokens`;
 				updated = true;
 			}
 			if (selectedModel) {
@@ -299,7 +466,14 @@ export default async function (pi: ExtensionAPI) {
 			}
 			discoveredMetadata.add(modelId);
 			if (loadedFooterStatus && ctx) {
-				ctx.ui.setStatus(PROVIDER_ID, ctx.ui.theme.fg("dim", loadedFooterStatus));
+				const prefix = ctx.ui.theme.fg("success", "[llama.cpp]   ");
+				ctx.ui.setWidget(PROVIDER_ID, [
+					prefix +
+						ctx.ui.theme.fg(
+							"text",
+							`${displayName}: Loaded` + (nCtx ? ` with context ${nCtx} tokens` : ""),
+						),
+				]);
 				clearFooterStatusLater();
 			}
 			if (!updated) {
@@ -315,11 +489,16 @@ export default async function (pi: ExtensionAPI) {
 		} catch (error) {
 			const err = error as Error;
 			const msg = err.name === "AbortError" ? "timeout" : err.message;
-			ctx?.ui.setStatus(PROVIDER_ID, undefined);
+			ctx?.ui.setWidget(PROVIDER_ID, undefined);
 			ctx?.ui.notify(`[llama-cpp] /props for ${modelId} failed: ${msg}`, "error");
 		} finally {
 			clearTimeout(timer);
 			pendingMetadata.delete(modelId);
+			// Stop SSE connection when done
+			if (sseAbortController) {
+				sseAbortController.abort();
+				sseAbortController = null;
+			}
 		}
 	}
 
