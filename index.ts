@@ -212,6 +212,7 @@ export default async function (pi: ExtensionAPI) {
 					contextWindow,
 					maxTokens: Math.min(DEFAULT_MAX_TOKENS, contextWindow),
 					compat: previous?.compat,
+					status: model.status,
 				} as LlamaModel;
 			});
 
@@ -219,6 +220,10 @@ export default async function (pi: ExtensionAPI) {
 				console.warn(`[llama-cpp] no models returned from ${baseUrl}/models`);
 				return;
 			}
+
+			// Track which model is currently loaded on the server
+			const loadedModel = currentModels.find((m) => m.status?.value === "loaded");
+			currentlyLoadedModel = loadedModel?.id ?? null;
 
 			pi.registerProvider(PROVIDER_ID, {
 				name: "llama.cpp",
@@ -234,8 +239,10 @@ export default async function (pi: ExtensionAPI) {
 
 	const discoveredMetadata = new Set<string>();
 	const pendingMetadata = new Set<string>();
+	let currentlyLoadedModel: string | null = null;
 	let statusTimeout: ReturnType<typeof setTimeout> | undefined;
 	let sseAbortController: AbortController | null = null;
+	let propsAbortController: AbortController | null = null;
 
 	function clearFooterStatusTimeout(): void {
 		if (statusTimeout !== undefined) {
@@ -304,20 +311,30 @@ export default async function (pi: ExtensionAPI) {
 					try {
 						const sseEvent: ApiModelsSseEvent = JSON.parse(dataLines);
 
-						// Only process events for the model we're monitoring
-						if (sseEvent.model !== modelId) {
-							continue;
-						}
-
-						const currentModel = currentModels.find((m) => m.id === sseEvent.model);
-						const displayName = currentModel?.name.split(" ")[0] || sseEvent.model;
-
+						// Process status events for all models to keep discoveredMetadata and
+						// currentlyLoadedModel in sync.
 						if (
 							sseEvent.event === "model_status" ||
 							sseEvent.event === "status_change" ||
 							sseEvent.event === "status_update"
 						) {
 							const status = sseEvent.data.status;
+
+							if (status === "unloaded") {
+								discoveredMetadata.delete(sseEvent.model);
+								if (currentlyLoadedModel === sseEvent.model) {
+									currentlyLoadedModel = null;
+								}
+							}
+							if (status === "loaded") {
+								currentlyLoadedModel = sseEvent.model;
+							}
+						}
+
+						// Progress UI is only for the model we're actively loading
+						if (sseEvent.model === modelId) {
+							const currentModel = currentModels.find((m) => m.id === sseEvent.model);
+							const displayName = currentModel?.name.split(" ")[0] || sseEvent.model;
 							const progress = sseEvent.data.progress;
 
 							if (sseEvent.data.exit_code && sseEvent.data.exit_code !== 0) {
@@ -332,11 +349,7 @@ export default async function (pi: ExtensionAPI) {
 								return;
 							}
 
-							if (status === "unloaded") {
-								discoveredMetadata.delete(sseEvent.model);
-							}
-
-							if (status === "loading" && progress) {
+							if (sseEvent.data.status === "loading" && progress) {
 								const stageLabel = progress.current
 									? MODEL_LOAD_STAGE_LABELS[progress.current] || progress.current
 									: "Loading";
@@ -350,9 +363,12 @@ export default async function (pi: ExtensionAPI) {
 				}
 			}
 		} catch (error) {
-			if (!(error instanceof DOMException && error.name === "AbortError")) {
-				console.warn(`[llama-cpp] SSE error: ${(error as Error).message}`);
+			// Suppress errors from intentionally-aborted SSE connections.
+			const msg = (error as Error).message;
+			if (signal.aborted && (error instanceof DOMException || msg === "terminated")) {
+				return;
 			}
+			ctx?.ui.notify(`[llama-cpp] SSE error: ${msg}`, "warning");
 		} finally {
 			sseAbortController = null;
 		}
@@ -370,19 +386,26 @@ export default async function (pi: ExtensionAPI) {
 			return;
 		}
 		const displayName = model.name.split(" ")[0];
+		// Use tracked state instead of stale currentModels status.
+		const isLoaded = currentlyLoadedModel === modelId;
+
 		if (discoveredMetadata.has(modelId)) {
-			// Provider re-registration does not update Pi's active model snapshot, so copy
-			// already-discovered metadata into the selected model when available.
-			if (selectedModel) {
-				selectedModel.contextWindow = model.contextWindow;
-				selectedModel.maxTokens = model.maxTokens;
-				if (model.reasoning) {
-					selectedModel.reasoning = model.reasoning;
-					selectedModel.thinkingLevelMap = model.thinkingLevelMap;
-					selectedModel.compat = model.compat;
+			// If discovered but no longer loaded, clear cache and fall through to reload.
+			if (!isLoaded) {
+				discoveredMetadata.delete(modelId);
+			} else {
+				// Copy cached metadata into the selected model snapshot.
+				if (selectedModel) {
+					selectedModel.contextWindow = model.contextWindow;
+					selectedModel.maxTokens = model.maxTokens;
+					if (model.reasoning) {
+						selectedModel.reasoning = model.reasoning;
+						selectedModel.thinkingLevelMap = model.thinkingLevelMap;
+						selectedModel.compat = model.compat;
+					}
 				}
+				return;
 			}
-			return;
 		}
 		if (pendingMetadata.has(modelId)) {
 			return;
@@ -391,9 +414,14 @@ export default async function (pi: ExtensionAPI) {
 		pendingMetadata.add(modelId);
 		// Cancel any pending clear timeout from a previous model load.
 		clearFooterStatusTimeout();
-		const controller = new AbortController();
-		const timer = setTimeout(() => controller.abort(), timeoutMs);
-		const propsUrl = `${baseUrl.replace(/\/v1$/, "")}/props?model=${encodeURIComponent(modelId)}&autoload=${autoload}`;
+		// Abort any in-flight /props request from a previous model.
+		if (propsAbortController) {
+			propsAbortController.abort();
+		}
+		propsAbortController = new AbortController();
+		const timer = setTimeout(() => propsAbortController.abort(), timeoutMs);
+		const shouldAutoload = autoload && !isLoaded;
+		const propsUrl = `${baseUrl.replace(/\/v1$/, "")}/props?model=${encodeURIComponent(modelId)}&autoload=${shouldAutoload}`;
 		const clearFooterStatusLater = () => {
 			clearFooterStatusTimeout();
 			statusTimeout = setTimeout(() => {
@@ -403,7 +431,7 @@ export default async function (pi: ExtensionAPI) {
 		};
 
 		try {
-			if (autoload && ctx) {
+			if (shouldAutoload && ctx) {
 				let loader = null;
 				ctx.ui.setWidget(PROVIDER_ID, (ui, theme) => {
 					const prefix = theme.fg("accent", " [llama.cpp]");
@@ -426,10 +454,13 @@ export default async function (pi: ExtensionAPI) {
 				void connectToLoadingProgress(modelId, ctx, loader);
 			}
 
-			const response = await fetch(propsUrl, { signal: controller.signal });
+			const response = await fetch(propsUrl, { signal: propsAbortController.signal });
 			if (!response.ok) {
-				ctx?.ui.setWidget(PROVIDER_ID, undefined);
-				ctx?.ui.notify(`[llama-cpp] /props for ${modelId} returned ${response.status}`, "error");
+				// 500 during autoload is expected when the server cancels a load to start
+				// another model. Suppress the notification for that case.
+				if (!(shouldAutoload && response.status === 500)) {
+					ctx?.ui.notify(`[llama-cpp] /props for ${modelId} returned ${response.status}`, "error");
+				}
 				return;
 			}
 			const data: unknown = await response.json();
@@ -437,13 +468,12 @@ export default async function (pi: ExtensionAPI) {
 				const errors = [...validatePropsResponse.Errors(data)]
 					.map((e) => `${"path" in e ? e.path : ""} ${e.message}`)
 					.join("; ");
-				ctx?.ui.setWidget(PROVIDER_ID, undefined);
 				ctx?.ui.notify(`[llama-cpp] invalid /props response for ${modelId}: ${errors}`, "error");
 				return;
 			}
 			const nCtx = data.default_generation_settings?.n_ctx;
 			let updated = false;
-			let loadedFooterStatus = autoload ? `[llama.cpp] ${displayName} loaded` : undefined;
+			let loadedFooterStatus = shouldAutoload ? `[llama.cpp] ${displayName} loaded` : undefined;
 			if (typeof nCtx === "number" && nCtx > 0) {
 				model.contextWindow = nCtx;
 				model.maxTokens = Math.min(DEFAULT_MAX_TOKENS, nCtx);
@@ -465,7 +495,10 @@ export default async function (pi: ExtensionAPI) {
 				updated = true;
 			}
 			discoveredMetadata.add(modelId);
-			if (loadedFooterStatus && ctx) {
+			if (shouldAutoload) {
+				currentlyLoadedModel = modelId;
+			}
+			if (loadedFooterStatus && ctx && !isLoaded) {
 				const prefix = ctx.ui.theme.fg("success", "[llama.cpp] ✓");
 				ctx.ui.setWidget(PROVIDER_ID, [
 					prefix +
@@ -488,12 +521,14 @@ export default async function (pi: ExtensionAPI) {
 			});
 		} catch (error) {
 			const err = error as Error;
-			const msg = err.name === "AbortError" ? "timeout" : err.message;
-			ctx?.ui.setWidget(PROVIDER_ID, undefined);
-			ctx?.ui.notify(`[llama-cpp] /props for ${modelId} failed: ${msg}`, "error");
+			// Suppress notification for aborted requests (model was switched).
+			if (err.name !== "AbortError") {
+				ctx?.ui.notify(`[llama-cpp] /props for ${modelId} failed: ${err.message}`, "error");
+			}
 		} finally {
 			clearTimeout(timer);
 			pendingMetadata.delete(modelId);
+			propsAbortController = null;
 			// Stop SSE connection when done
 			if (sseAbortController) {
 				sseAbortController.abort();
