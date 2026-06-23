@@ -303,6 +303,12 @@ export default async function (pi: ExtensionAPI) {
 
 					try {
 						const sseEvent: ApiModelsSseEvent = JSON.parse(dataLines);
+
+						// Only process events for the model we're monitoring
+						if (sseEvent.model !== modelId) {
+							continue;
+						}
+
 						const currentModel = currentModels.find((m) => m.id === sseEvent.model);
 						const displayName = currentModel?.name.split(" ")[0] || sseEvent.model;
 
@@ -392,13 +398,7 @@ export default async function (pi: ExtensionAPI) {
 			clearFooterStatusTimeout();
 			statusTimeout = setTimeout(() => {
 				statusTimeout = undefined;
-				ctx?.ui.setWidget(PROVIDER_ID, () => {
-					return {
-						render: () => {
-							return " ";
-						},
-					};
-				});
+				ctx?.ui.setWidget(PROVIDER_ID, undefined);
 			}, 8000);
 		};
 
