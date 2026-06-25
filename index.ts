@@ -270,7 +270,9 @@ export default async function (pi: ExtensionAPI) {
 			const response = await fetch(`${baseUrl.replace(/\/v1$/, "")}/models/sse`, { signal });
 
 			if (!response.ok) {
-				console.warn(`[llama-cpp] SSE connection failed: ${response.status}`);
+				if (response.status !== 404) {
+                                        ctx?.ui.notify(`[llama-cpp] loading progress ${response.status})`, "warning");
+                                }
 				return;
 			}
 
