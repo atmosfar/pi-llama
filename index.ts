@@ -271,8 +271,8 @@ export default async function (pi: ExtensionAPI) {
 
 			if (!response.ok) {
 				if (response.status !== 404) {
-                                        ctx?.ui.notify(`[llama-cpp] loading progress ${response.status})`, "warning");
-                                }
+					ctx?.ui.notify(`[llama-cpp] loading progress ${response.status})`, "warning");
+				}
 				return;
 			}
 
